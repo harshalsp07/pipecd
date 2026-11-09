@@ -16,13 +16,17 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 	"go.uber.org/zap"
 
 	"github.com/pipe-cd/pipecd/pkg/app/server/service/apiservice"
+	"github.com/pipe-cd/pipecd/pkg/cache"
+	"github.com/pipe-cd/pipecd/pkg/cache/cachetest"
 	"github.com/pipe-cd/pipecd/pkg/datastore"
 	"github.com/pipe-cd/pipecd/pkg/datastore/datastoretest"
 	"github.com/pipe-cd/pipecd/pkg/model"
@@ -272,6 +276,180 @@ func TestListApplicationsFilterDeleted(t *testing.T) {
 				gotIDs[i] = app.Id
 			}
 			assert.ElementsMatch(t, tc.expectedAppIDs, gotIDs)
+		})
+	}
+}
+
+func TestListPipeds(t *testing.T) {
+	onlineStat, err := json.Marshal(&model.PipedStat{Timestamp: time.Now().Unix()})
+	assert.NoError(t, err)
+
+	testcases := []struct {
+		name           string
+		req            *apiservice.ListPipedsRequest
+		expectedStatus map[string]model.Piped_ConnectionStatus
+	}{
+		{
+			name: "status is left unset when not requested",
+			req:  &apiservice.ListPipedsRequest{},
+			expectedStatus: map[string]model.Piped_ConnectionStatus{
+				"piped-1": model.Piped_UNKNOWN,
+				"piped-2": model.Piped_UNKNOWN,
+			},
+		},
+		{
+			name: "status is filled in from piped stats when requested",
+			req:  &apiservice.ListPipedsRequest{WithStatus: true},
+			expectedStatus: map[string]model.Piped_ConnectionStatus{
+				"piped-1": model.Piped_ONLINE,
+				"piped-2": model.Piped_OFFLINE,
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			store := datastoretest.NewMockPipedStore(ctrl)
+			store.EXPECT().
+				List(gomock.Any(), gomock.Any()).
+				DoAndReturn(func(_ context.Context, opts datastore.ListOptions) ([]*model.Piped, error) {
+					// Only pipeds of the API key's project must be listed.
+					assert.Equal(t, []datastore.ListFilter{
+						{Field: "ProjectId", Operator: datastore.OperatorEqual, Value: "project-id"},
+					}, opts.Filters)
+					return []*model.Piped{
+						{Id: "piped-1", ProjectId: "project-id", Keys: []*model.PipedKey{{Hash: "secret"}}},
+						{Id: "piped-2", ProjectId: "project-id"},
+					}, nil
+				})
+
+			statCache := cachetest.NewMockCache(ctrl)
+			statCache.EXPECT().Get("piped-1").Return(onlineStat, nil).AnyTimes()
+			statCache.EXPECT().Get("piped-2").Return(nil, cache.ErrNotFound).AnyTimes()
+
+			api := &API{
+				pipedStore:     store,
+				pipedStatCache: statCache,
+				logger:         zap.NewNop(),
+			}
+			ctx := rpcauth.ContextWithAPIKey(context.TODO(), &model.APIKey{
+				ProjectId: "project-id",
+				Role:      model.APIKey_READ_ONLY,
+			})
+
+			resp, err := api.ListPipeds(ctx, tc.req)
+			assert.NoError(t, err)
+			assert.Len(t, resp.Pipeds, 2)
+			for _, p := range resp.Pipeds {
+				assert.Equal(t, tc.expectedStatus[p.Id], p.Status, p.Id)
+				for _, k := range p.Keys {
+					assert.NotEqual(t, "secret", k.Hash, "piped key hash must be redacted")
+				}
+			}
+		})
+	}
+}
+
+func TestListDeploymentsFilters(t *testing.T) {
+	testcases := []struct {
+		name           string
+		req            *apiservice.ListDeploymentsRequest
+		expectedErr    string
+		expectedFilter []datastore.ListFilter
+	}{
+		{
+			name:           "no status filter when all given statuses are empty",
+			req:            &apiservice.ListDeploymentsRequest{Statuses: []string{"", ""}},
+			expectedFilter: nil,
+		},
+		{
+			name:           "no kind filter when all given kinds are empty",
+			req:            &apiservice.ListDeploymentsRequest{Kinds: []string{""}},
+			expectedFilter: nil,
+		},
+		{
+			name: "status filter uses the first non-empty status",
+			req:  &apiservice.ListDeploymentsRequest{Statuses: []string{"", "DEPLOYMENT_SUCCESS"}},
+			expectedFilter: []datastore.ListFilter{
+				{Field: "Status", Operator: datastore.OperatorEqual, Value: model.DeploymentStatus_DEPLOYMENT_SUCCESS},
+			},
+		},
+		{
+			name: "status filter is applied when a single status is given",
+			req:  &apiservice.ListDeploymentsRequest{Statuses: []string{"DEPLOYMENT_RUNNING"}},
+			expectedFilter: []datastore.ListFilter{
+				{Field: "Status", Operator: datastore.OperatorEqual, Value: model.DeploymentStatus_DEPLOYMENT_RUNNING},
+			},
+		},
+		{
+			name: "kind filter is applied when a valid kind is given",
+			req:  &apiservice.ListDeploymentsRequest{Kinds: []string{"KUBERNETES"}},
+			expectedFilter: []datastore.ListFilter{
+				{Field: "Kind", Operator: datastore.OperatorEqual, Value: model.ApplicationKind_KUBERNETES},
+			},
+		},
+		{
+			name: "both filters are applied when a valid status and kind are given",
+			req:  &apiservice.ListDeploymentsRequest{Statuses: []string{"DEPLOYMENT_SUCCESS"}, Kinds: []string{"KUBERNETES"}},
+			expectedFilter: []datastore.ListFilter{
+				{Field: "Status", Operator: datastore.OperatorEqual, Value: model.DeploymentStatus_DEPLOYMENT_SUCCESS},
+				{Field: "Kind", Operator: datastore.OperatorEqual, Value: model.ApplicationKind_KUBERNETES},
+			},
+		},
+		{
+			name:           "invalid status name is rejected",
+			req:            &apiservice.ListDeploymentsRequest{Statuses: []string{"BOGUS"}},
+			expectedErr:    "rpc error: code = InvalidArgument desc = BOGUS is invalid deployment status",
+			expectedFilter: nil,
+		},
+		{
+			name:           "invalid kind name is rejected",
+			req:            &apiservice.ListDeploymentsRequest{Kinds: []string{"BOGUS"}},
+			expectedErr:    "rpc error: code = InvalidArgument desc = BOGUS is invalid application kind",
+			expectedFilter: nil,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			var gotFilter []datastore.ListFilter
+			store := datastoretest.NewMockDeploymentStore(ctrl)
+			store.EXPECT().
+				List(gomock.Any(), gomock.Any()).
+				DoAndReturn(func(_ context.Context, opts datastore.ListOptions) ([]*model.Deployment, string, error) {
+					for _, f := range opts.Filters {
+						if f.Field != "ProjectId" {
+							gotFilter = append(gotFilter, f)
+						}
+					}
+					return nil, "", nil
+				}).
+				AnyTimes()
+
+			api := &API{
+				deploymentStore: store,
+				logger:          zap.NewNop(),
+			}
+			ctx := rpcauth.ContextWithAPIKey(context.TODO(), &model.APIKey{
+				ProjectId: "project-id",
+				Role:      model.APIKey_READ_ONLY,
+			})
+
+			_, err := api.ListDeployments(ctx, tc.req)
+			if tc.expectedErr != "" {
+				if assert.Error(t, err) {
+					assert.Equal(t, tc.expectedErr, err.Error())
+				}
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expectedFilter, gotFilter)
 		})
 	}
 }
