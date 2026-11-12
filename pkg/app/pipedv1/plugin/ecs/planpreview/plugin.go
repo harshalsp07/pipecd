@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/ecs/config"
+	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/ecs/provider"
 )
 
 var (
@@ -74,7 +75,7 @@ func (p *Plugin) GetPlanPreview(
 
 	var serviceDiff string
 	if targetInput.ServiceDefinitionFile != "" {
-		targetServiceDef, err := loadServiceDef(targetDS.ApplicationDirectory, targetInput.ServiceDefinitionFile)
+		targetServiceDef, err := provider.ParseServiceDefinition(targetDS.ApplicationDirectory, targetInput.ServiceDefinitionFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load target service definition: %w", err)
 		}
@@ -86,7 +87,7 @@ func (p *Plugin) GetPlanPreview(
 				return nil, fmt.Errorf("failed to load running app config: %w", err)
 			}
 			if runningAppCfg.Spec.Input.ServiceDefinitionFile != "" {
-				sd, err := loadServiceDef(runningDS.ApplicationDirectory, runningAppCfg.Spec.Input.ServiceDefinitionFile)
+				sd, err := provider.ParseServiceDefinition(runningDS.ApplicationDirectory, runningAppCfg.Spec.Input.ServiceDefinitionFile)
 				if err != nil {
 					return nil, fmt.Errorf("failed to load running service definition: %w", err)
 				}
@@ -111,18 +112,6 @@ func loadTaskDef(appDir, filename string) (types.TaskDefinition, error) {
 	var obj types.TaskDefinition
 	if err := yaml.Unmarshal(data, &obj); err != nil {
 		return types.TaskDefinition{}, err
-	}
-	return obj, nil
-}
-
-func loadServiceDef(appDir, filename string) (types.Service, error) {
-	data, err := os.ReadFile(filepath.Join(appDir, filename))
-	if err != nil {
-		return types.Service{}, err
-	}
-	var obj types.Service
-	if err := yaml.Unmarshal(data, &obj); err != nil {
-		return types.Service{}, err
 	}
 	return obj, nil
 }

@@ -16,6 +16,9 @@ package planpreview
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	sdk "github.com/pipe-cd/piped-plugin-sdk-go"
@@ -145,4 +148,32 @@ func TestPlugin_GetPlanPreview(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPlugin_GetPlanPreview_ClusterChange(t *testing.T) {
+	const (
+		runningCluster = "arn:aws:ecs:us-east-1:123456789012:cluster/pipecd-test"
+		targetCluster  = "arn:aws:ecs:us-east-1:123456789012:cluster/pipecd-other"
+	)
+
+	targetAppDir := t.TempDir()
+	require.NoError(t, os.CopyFS(targetAppDir, os.DirFS(runningDir)))
+	serviceFile := filepath.Join(targetAppDir, "servicedef.yaml")
+	data, err := os.ReadFile(serviceFile)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "cluster: "+runningCluster)
+	targetService := strings.Replace(string(data), "cluster: "+runningCluster, "cluster: "+targetCluster, 1)
+	require.NoError(t, os.WriteFile(serviceFile, []byte(targetService), 0o600))
+
+	p := &Plugin{}
+	input := makeInput(t, targetAppDir, runningDir)
+	resp, err := p.GetPlanPreview(t.Context(), nil, deployTargets(t), input)
+	require.NoError(t, err)
+	require.Len(t, resp.Results, 1)
+
+	result := resp.Results[0]
+	assert.False(t, result.NoChange)
+	assert.Equal(t, "service definition changed", result.Summary)
+	assert.Contains(t, string(result.Details), "-ClusterArn: "+runningCluster)
+	assert.Contains(t, string(result.Details), "+ClusterArn: "+targetCluster)
 }
